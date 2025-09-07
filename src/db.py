@@ -1,4 +1,44 @@
-import os
+# Simple in-memory DB for testing
+tracked_items = []
+current_id = 1
+
+class Item:
+    def __init__(self, user_id, platform, product_id, title, image_url, affiliate_url, price):
+        global current_id
+        self.id = str(current_id)
+        current_id += 1
+        self.user_id = user_id
+        self.platform = platform
+        self.product_id = product_id
+        self.title = title
+        self.image_url = image_url
+        self.affiliate_url = affiliate_url
+        self.current_price = price
+        self.lowest_price = price
+        self.highest_price = price
+
+def init_db():
+    global tracked_items
+    tracked_items = []
+
+def add_tracked_item(user_id, platform, product_id, title, image_url, affiliate_url, price):
+    item = Item(user_id, platform, product_id, title, image_url, affiliate_url, price)
+    tracked_items.append(item)
+    return item
+
+def list_tracked_items(user_id):
+    return [it for it in tracked_items if it.user_id == user_id]
+
+def remove_tracked_item(user_id, item_id):
+    global tracked_items
+    for it in tracked_items:
+        if it.user_id == user_id and it.id == item_id:
+            tracked_items.remove(it)
+            return True
+    return False
+
+
+'''import os
 from sqlalchemy import create_engine, Column, Integer, String, Numeric, DateTime, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -95,4 +135,4 @@ def update_prices(item_id, new_price):
         db.refresh(item)
         return item, changed
     finally:
-        db.close()
+        db.close()'''

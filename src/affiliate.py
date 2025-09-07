@@ -1,4 +1,19 @@
-import os
+def get_product_by_url(url: str):
+    """
+    Dummy product fetcher for testing.
+    Replace with official Amazon/Flipkart API + affiliate URL conversion later.
+    """
+    return {
+        "platform": "Amazon" if "amazon" in url else "Flipkart",
+        "product_id": "123456",
+        "title": "Demo Product",
+        "image": "https://via.placeholder.com/150",
+        "affiliate_url": url,
+        "price": 999
+    }
+
+
+'''import os
 import re
 import requests
 from src.utils import extract_amazon_asin, extract_flipkart_id
@@ -57,4 +72,4 @@ def get_product_by_url(url: str):
             return _demo_product("flipkart", url)
         except Exception:
             return _demo_product("flipkart", url)
-    return _demo_product("unknown", url)
+    return _demo_product("unknown", url)'''

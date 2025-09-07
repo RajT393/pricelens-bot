@@ -1,4 +1,28 @@
-import os
+import threading
+import time
+import src.db as db
+
+scheduler_running = False
+
+def start_scheduler():
+    global scheduler_running
+    scheduler_running = True
+    t = threading.Thread(target=run_scheduler, daemon=True)
+    t.start()
+
+def stop_scheduler():
+    global scheduler_running
+    scheduler_running = False
+
+def run_scheduler():
+    while scheduler_running:
+        for item in db.tracked_items:
+            # dummy update, later use API to check price
+            item.current_price = item.current_price
+        time.sleep(1800)  # 30 mins
+
+
+'''import os
 import time
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -84,4 +108,4 @@ def start_scheduler():
     print(f"Scheduler started. Checking every {INTERVAL_MINUTES} minutes.")
 
 def stop_scheduler():
-    scheduler.shutdown(wait=False)
+    scheduler.shutdown(wait=False)'''
