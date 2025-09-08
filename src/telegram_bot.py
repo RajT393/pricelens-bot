@@ -1,193 +1,174 @@
 import os
-import asyncio
+import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 from src.affiliate import get_product_by_url
-import src.db as db
+from src.db import get_session, User, Product
+import datetime
+import asyncio
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID")
+
+logger = logging.getLogger("telegram_bot")
+logging.basicConfig(level=logging.INFO)
+
+async def _reply_start(update: Update):
+    text = (
+        "🎉 Great to see you! Welcome!\n\n"
+        "=> I am PriceLens — a Price Tracker & Alert Bot.\n"
+        "=> Send a product URL (Amazon / Flipkart / Ajio / Shopsy) and I'll track price changes and alert you.\n\n"
+        "Save Time! Save Money!!\n\nClick /help to get more help."
+    )
+    await update.message.reply_text(text)
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Welcome to Pricelens Bot! Use /track <product-link> to start tracking.\nCommands: /track, /list, /stop <id}"
-    )
+    await _reply_start(update)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Commands:\n/track <url> - start tracking a product\n/list - list your tracked items\n/stop <id> - stop tracking an item"
-    )
+    text = (
+        "/track <url>  - start tracking (or just send URL)\n"
+        "/list - list tracked products\n"
+        "/stop - stop all tracking\n"
+        "/stop_<product_id> - stop specific item\n"
+        "/demovideo - demo link\n"        )
+    await update.message.reply_text(text)
 
 async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
-        await update.message.reply_text("❌ Please supply a product link. Example: /track https://www.amazon.in/...")
+        await update.message.reply_text("Send a product URL or use /track <url>")
         return
     url = args[0].strip()
-    data = get_product_by_url(url)
-    item = db.add_tracked_item(
-        user_id=update.effective_user.id,
-        platform=data.get("platform"),
-        product_id=data.get("product_id"),
-        title=data.get("title"),
-        image_url=data.get("image"),
-        affiliate_url=data.get("affiliate_url"),
-        price=data.get("price")
-    )
-    buttons = [[InlineKeyboardButton("🛒 Buy Now", url=data.get("affiliate_url"))]]
-    reply_markup = InlineKeyboardMarkup(buttons)
-    caption = f"✅ Tracking started: {data.get('title')}\n💰 Current: ₹{data.get('price')}\nID: {item.id}"
-    if data.get("image"):
-        await update.message.reply_photo(photo=data.get("image"), caption=caption, reply_markup=reply_markup)
-    else:
-        await update.message.reply_text(caption, reply_markup=reply_markup)
+    await handle_new_tracking(update.effective_user, "telegram", url, update)
+
+async def handle_new_tracking(user_obj, platform, url, update_obj=None, reply_func=None):
+    try:
+        pinfo = get_product_by_url(url)
+    except Exception as e:
+        text = f"Failed to fetch product details: {e}"
+        if update_obj:
+            await update_obj.message.reply_text(text)
+        return
+
+    uid = str(user_obj.id) if platform == "telegram" else str(user_obj)
+    with get_session() as s:
+        u = s.query(User).filter(User.user_id == uid, User.platform == platform).first()
+        if not u:
+            u = User(user_id=uid, name=(user_obj.full_name if platform=="telegram" else uid), platform=platform)
+            s.add(u); s.commit()
+        pr = Product(
+            product_id = pinfo.get("product_id"),
+            user_id = uid,
+            url = url,
+            platform = pinfo.get("platform"),
+            product_name = pinfo.get("title"),
+            image_url = pinfo.get("image"),
+            current_price = pinfo.get("price"),
+            prev_price = None,
+            lowest_price = pinfo.get("price"),
+            highest_price = pinfo.get("price"),
+            affiliate_link = pinfo.get("affiliate_link"),
+            last_checked = datetime.datetime.utcnow(),
+            tracking_status = "active"
+        )
+        s.add(pr); s.commit(); s.refresh(pr)
+
+        buy_btn = InlineKeyboardButton("🛒 Buy Now", url=pr.affiliate_link or pr.url)
+        stop_btn = InlineKeyboardButton("🔴 Stop Tracking", callback_data=f"stop:{pr.id}")
+        list_btn = InlineKeyboardButton("📋 Tracked Items", callback_data="list")
+        deals_btn = InlineKeyboardButton("🛍️ Today's Deals", callback_data="deals")
+        kb = InlineKeyboardMarkup([[buy_btn],[stop_btn, list_btn, deals_btn]])
+        msg = (
+            f"✅ Tracking started!\n\n"
+            f"{pr.product_name}\n\n"
+            f"Current Price: ₹{pr.current_price if pr.current_price is not None else 'N/A'}\n\n"
+            f"Click here to open: {pr.affiliate_link or pr.url}\n\n"
+            f"⏱ Updated at [{pr.last_checked.strftime('%d %b %Y, %H:%M')}]\n\n"
+            "😉 I've started tracking this product. I will send you an alert when the price changes!"
+        )
+        if pr.image_url:
+            await update_obj.message.reply_photo(photo=pr.image_url, caption=msg, reply_markup=kb)
+        else:
+            await update_obj.message.reply_text(msg, reply_markup=kb)
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    items = db.list_tracked_items(update.effective_user.id)
-    if not items:
-        await update.message.reply_text("You have no tracked items. Use /track <url> to add.")
-        return
-    messages = []
-    for it in items:
-        messages.append(f"ID: {it.id} | {it.title}\nCurrent: ₹{it.current_price} | Lowest: ₹{it.lowest_price} | Highest: ₹{it.highest_price}")
-    text = "\n\n".join(messages)
-    await update.message.reply_text(text)
+    uid = str(update.effective_user.id)
+    with get_session() as s:
+        prods = s.query(Product).filter(Product.user_id==uid, Product.tracking_status=="active").all()
+        if not prods:
+            await update.message.reply_text("You have no tracked items. Send a product URL to start.")
+            return
+        total = 0
+        for p in prods:
+            total += 1
+            stop_cb = InlineKeyboardButton("🔴 Stop Tracking", callback_data=f"stop:{p.id}")
+            buy_cb = InlineKeyboardButton("🛒 Buy Now", url=p.affiliate_link or p.url)
+            kb = InlineKeyboardMarkup([[buy_cb],[stop_cb]])
+            text = f"{total}. {p.product_name}\nClick here: {p.affiliate_link or p.url}\nID: {p.id}\nCurrent: ₹{p.current_price}"
+            if p.image_url:
+                await update.message.reply_photo(photo=p.image_url, caption=text, reply_markup=kb)
+            else:
+                await update.message.reply_text(text, reply_markup=kb)
+        await update.message.reply_text(f"🦋 Total Products: {total}")
 
-async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /stop <item-id>")
-        return
-    item_id = args[0]
-    ok = db.remove_tracked_item(update.effective_user.id, item_id)
-    if ok:
-        await update.message.reply_text(f"Stopped tracking item {item_id}")
-    else:
-        await update.message.reply_text(f"No item with ID {item_id} found in your list.")
+async def stop_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    with get_session() as s:
+        s.query(Product).filter(Product.user_id==uid).update({"tracking_status":"stopped"})
+        s.commit()
+    await update.message.reply_text("Stopped tracking all your items.")
+
+async def stop_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data.startswith("stop:"):
+        pid = int(data.split(":",1)[1])
+        with get_session() as s:
+            p = s.query(Product).filter(Product.id==pid).first()
+            if not p:
+                await query.edit_message_text("Item not found.")
+                return
+            p.tracking_status = "stopped"
+            s.add(p); s.commit()
+            await query.edit_message_text(f"Stopped tracking item {pid}")
+
+async def list_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await list_command(update, context)
+
+async def deals_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with get_session() as s:
+        promos = s.query(Product).filter(Product.tracking_status=="active").limit(5).all()
+    await update.callback_query.answer()
+    await update.callback_query.message.reply_text("Today's deals will be here (admin feature).")
+
 
 async def track_by_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if text.startswith("http"):
-        context.args = [text]
-        await track_command(update, context)
+        await handle_new_tracking(update.effective_user, "telegram", text, update)
 
-# this will be called from FastAPI startup
 async def start_telegram_bot():
     if not TELEGRAM_TOKEN:
-        print("Telegram token missing - skipping telegram startup.")
+        logger.warning("TELEGRAM token missing. Telegram functions disabled.")
         return
+
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("track", track_command))
     app.add_handler(CommandHandler("list", list_command))
-    app.add_handler(CommandHandler("stop", stop_command))
+    app.add_handler(CommandHandler("stop", stop_all_command))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), track_by_message))
-    print("Telegram bot started (polling)...")
-    await app.run_polling()
+    app.add_handler(CallbackQueryHandler(stop_callback_handler, pattern=r"^stop:"))
+    app.add_handler(CallbackQueryHandler(list_callback_handler, pattern=r"^list$"))
+    app.add_handler(CallbackQueryHandler(deals_callback_handler, pattern=r"^deals$"))
 
+    logger.info("Telegram polling started")
 
-'''import os
-import threading
-import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
-from src.affiliate import get_product_by_url
-import src.db
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-
-if not TELEGRAM_TOKEN:
-    print("Warning: TELEGRAM_BOT_TOKEN is not set. Telegram functionality will not start until you set it in .env")
-
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        """👋 Welcome to Pricelens Bot! Use /track <product-link> to start tracking.
-Commands: /track, /list, /stop <id>"""
-    )
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Commands:\n/track <url> - start tracking a product\n/list - list your tracked items\n/stop <id> - stop tracking an item"
-    )
-
-
-async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        await update.message.reply_text("❌ Please supply a product link. Example: /track https://www.amazon.in/...")
-        return
-    url = args[0].strip()
-    data = get_product_by_url(url)
-    item = db.add_tracked_item(
-        user_id=update.effective_user.id,
-        platform=data.get("platform"),
-        product_id=data.get("product_id"),
-        title=data.get("title"),
-        image_url=data.get("image"),
-        affiliate_url=data.get("affiliate_url"),
-        price=data.get("price")
-    )
-    buttons = [[InlineKeyboardButton("🛒 Buy Now", url=data.get("affiliate_url"))]]
-    reply_markup = InlineKeyboardMarkup(buttons)
-    caption = f"✅ Tracking started: {data.get('title')}\n💰 Current: ₹{data.get('price')}\nID: {item.id}"
-    if data.get("image"):
-        await update.message.reply_photo(photo=data.get("image"), caption=caption, reply_markup=reply_markup)
-    else:
-        await update.message.reply_text(caption, reply_markup=reply_markup)
-
-
-async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    items = db.list_tracked_items(update.effective_user.id)
-    if not items:
-        await update.message.reply_text("You have no tracked items. Use /track <url> to add.")
-        return
-    messages = []
-    for it in items:
-        messages.append(f"ID: {it.id} | {it.title}\nCurrent: ₹{it.current_price} | Lowest: ₹{it.lowest_price} | Highest: ₹{it.highest_price}")
-    text = "\n\n".join(messages)
-    await update.message.reply_text(text)
-
-
-async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /stop <item-id>")
-        return
-    item_id = args[0]
-    ok = db.remove_tracked_item(update.effective_user.id, item_id)
-    if ok:
-        await update.message.reply_text(f"Stopped tracking item {item_id}")
-    else:
-        await update.message.reply_text(f"No item with ID {item_id} found in your list.")
-
-
-async def track_by_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # If user sends a plain link, try to track it automatically
-    text = update.message.text.strip()
-    if text.startswith("http"):
-        # emulate /track
-        context.args = [text]
-        await track_command(update, context)
-
-
-def run_telegram():
-    if not TELEGRAM_TOKEN:
-        print("Telegram token missing - skipping telegram startup.")
-        return
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("track", track_command))
-    app.add_handler(CommandHandler("list", list_command))
-    app.add_handler(CommandHandler("stop", stop_command))
-    # optional: handle plain links sent by user
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), track_by_message))
-    print("Starting Telegram polling...")
-    app.run_polling()
-
-
-def run_telegram_in_thread():
-    t = threading.Thread(target=run_telegram, daemon=True)
-    t.start()'''
+    # Instead of run_polling()
+    await app.initialize()
+    await app.start()
+    asyncio.create_task(app.updater.start_polling())

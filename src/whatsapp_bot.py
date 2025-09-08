@@ -1,115 +1,57 @@
 import os
-from fastapi import APIRouter, Request
-from twilio.rest import Client
-from twilio.twiml.messaging_response import MessagingResponse
-from src.affiliate import get_product_by_url
-import src.db as db
-
-router = APIRouter()
-
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
-
-client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-
-# Endpoint for Twilio webhook
-@router.post("/webhook")
-async def whatsapp_webhook(request: Request):
-    form = await request.form()
-    from_number = form.get("From")
-    body = form.get("Body", "").strip()
-
-    response = MessagingResponse()
-
-    if body.lower().startswith("/track"):
-        parts = body.split()
-        if len(parts) < 2:
-            response.message("❌ Please provide a product URL. Example: /track https://www.amazon.in/...")
-        else:
-            url = parts[1]
-            data = get_product_by_url(url)
-            item = db.add_tracked_item(
-                user_id=from_number,
-                platform=data.get("platform"),
-                product_id=data.get("product_id"),
-                title=data.get("title"),
-                image_url=data.get("image"),
-                affiliate_url=data.get("affiliate_url"),
-                price=data.get("price")
-            )
-            msg = f"✅ Tracking started: {data.get('title')}\n💰 Current: ₹{data.get('price')}\nID: {item.id}\nBuy Now: {data.get('affiliate_url')}"
-            response.message(msg)
-
-    elif body.lower().startswith("/list"):
-        items = db.list_tracked_items(from_number)
-        if not items:
-            response.message("You have no tracked items. Use /track <url> to add.")
-        else:
-            msgs = []
-            for it in items:
-                msgs.append(f"ID: {it.id} | {it.title}\nCurrent: ₹{it.current_price} | Lowest: ₹{it.lowest_price} | Highest: ₹{it.highest_price}")
-            response.message("\n\n".join(msgs))
-
-    elif body.lower().startswith("/stop"):
-        parts = body.split()
-        if len(parts) < 2:
-            response.message("Usage: /stop <item-id>")
-        else:
-            item_id = parts[1]
-            ok = db.remove_tracked_item(from_number, item_id)
-            if ok:
-                response.message(f"Stopped tracking item {item_id}")
-            else:
-                response.message(f"No item with ID {item_id} found in your list.")
-
-    else:
-        # If user sends a plain link
-        if body.startswith("http"):
-            data = get_product_by_url(body)
-            item = db.add_tracked_item(
-                user_id=from_number,
-                platform=data.get("platform"),
-                product_id=data.get("product_id"),
-                title=data.get("title"),
-                image_url=data.get("image"),
-                affiliate_url=data.get("affiliate_url"),
-                price=data.get("price")
-            )
-            msg = f"✅ Tracking started: {data.get('title')}\n💰 Current: ₹{data.get('price')}\nID: {item.id}\nBuy Now: {data.get('affiliate_url')}"
-            response.message(msg)
-        else:
-            response.message("Send /track <url> to start tracking a product.\nCommands: /track, /list, /stop <id>")
-
-    return str(response)
-
-
-
-'''from fastapi import APIRouter, Request
-import os
+import logging
 import requests
+from fastapi import APIRouter, Request, Response
 from src.affiliate import get_product_by_url
-import src.db
+from src.db import get_session, User, Product
+import datetime
 
 router = APIRouter()
+logger = logging.getLogger("whatsapp_bot")
+
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
-PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")
-VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN")
+WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")
+VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "pricelens_verify_token")
+BASE_URL = "https://graph.facebook.com/v17.0"
+
+def send_whatsapp_message(to: str, text: str, button_url: str = None, image_url: str = None):
+    if not (WHATSAPP_TOKEN and WHATSAPP_PHONE_ID):
+        logger.warning("WhatsApp credentials missing.")
+        return False
+    endpoint = f"{BASE_URL}/{WHATSAPP_PHONE_ID}/messages"
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+    if button_url:
+        payload = {
+            "messaging_product":"whatsapp",
+            "to": to,
+            "type":"interactive",
+            "interactive":{
+                "type":"button",
+                "body":{"text": text},
+                "action":{"buttons":[{"type":"url","url":button_url,"title":"🛒 Buy Now"}]}
+            }
+        }
+    else:
+        payload = {"messaging_product":"whatsapp","to":to,"type":"text","text":{"body":text}}
+    if image_url and not button_url:
+        img_payload = {"messaging_product":"whatsapp","to":to,"type":"image","image":{"link":image_url}}
+        requests.post(endpoint, headers=headers, json=img_payload, timeout=10)
+    r = requests.post(endpoint, headers=headers, json=payload, timeout=10)
+    return r.status_code < 300
 
 @router.get("/webhook")
-async def verify(req: Request):
+async def webhook_verify(req: Request):
     params = req.query_params
     mode = params.get("hub.mode")
     token = params.get("hub.verify_token")
     challenge = params.get("hub.challenge")
     if mode == "subscribe" and token == VERIFY_TOKEN:
-        return int(challenge)
-    return "Error: verification failed"
+        return Response(content=challenge)
+    return Response(content="Invalid verification", status_code=400)
 
 @router.post("/webhook")
-async def webhook(req: Request):
+async def whatsapp_incoming(req: Request):
     body = await req.json()
-    # Minimal defensive parsing of WhatsApp incoming messages
     try:
         entries = body.get("entry", [])
         for e in entries:
@@ -121,42 +63,68 @@ async def webhook(req: Request):
                     text = m.get("text", {}).get("body", "")
                     if not text:
                         continue
-                    # If user sent a link, track it
-                    if text.startswith("http"):
-                        p = get_product_by_url(text)
-                        item = db.add_tracked_item(user_id=from_num, platform=p.get("platform"),
-                                                   product_id=p.get("product_id"), title=p.get("title"),
-                                                   image_url=p.get("image"), affiliate_url=p.get("affiliate_url"),
-                                                   price=p.get("price"))
-                        send_whatsapp_message(from_num, f"✅ Tracking started: {p.get('title')}\n💰 ₹{p.get('price')}", p.get("affiliate_url"))
+                    text = text.strip()
+                    if text.lower().startswith("/track"):
+                        parts = text.split()
+                        if len(parts) < 2:
+                            send_whatsapp_message(from_num, "Send /track <url>")
+                            continue
+                        url = parts[1]
+                        try:
+                            pinfo = get_product_by_url(url)
+                        except Exception as e:
+                            send_whatsapp_message(from_num, f"Failed to fetch: {e}")
+                            continue
+                        with get_session() as s:
+                            u = s.query(User).filter(User.user_id==from_num, User.platform=="whatsapp").first()
+                            if not u:
+                                u = User(user_id=from_num, name=from_num, platform="whatsapp"); s.add(u); s.commit()
+                            pr = Product(product_id=pinfo.get("product_id"), user_id=from_num, url=url, platform=pinfo.get("platform"),
+                                         product_name=pinfo.get("title"), image_url=pinfo.get("image"), current_price=pinfo.get("price"),
+                                         prev_price=None, lowest_price=pinfo.get("price"), highest_price=pinfo.get("price"),
+                                         affiliate_link=pinfo.get("affiliate_link"), last_checked=datetime.datetime.utcnow(), tracking_status="active")
+                            s.add(pr); s.commit(); s.refresh(pr)
+                            send_whatsapp_message(from_num, f"✅ Tracking started: {pr.product_name}\nCurrent Price: ₹{pr.current_price}\nID:{pr.id}", pr.affiliate_link, pr.image_url)
+                    elif text.lower().startswith("/list"):
+                        with get_session() as s:
+                            prods = s.query(Product).filter(Product.user_id==from_num, Product.tracking_status=="active").all()
+                            if not prods:
+                                send_whatsapp_message(from_num, "No tracked items. Send /track <url>")
+                                continue
+                            for p in prods:
+                                send_whatsapp_message(from_num, f"ID:{p.id} | {p.product_name}\n₹{p.current_price}", p.affiliate_link, p.image_url)
+                    elif text.lower().startswith("/stop"):
+                        parts = text.split()
+                        if len(parts) < 2:
+                            send_whatsapp_message(from_num, "Usage: /stop <id>")
+                            continue
+                        pid = int(parts[1])
+                        with get_session() as s:
+                            p = s.query(Product).filter(Product.id==pid, Product.user_id==from_num).first()
+                            if not p:
+                                send_whatsapp_message(from_num, "Item not found.")
+                                continue
+                            p.tracking_status = "stopped"; s.add(p); s.commit()
+                            send_whatsapp_message(from_num, f"Stopped tracking item {pid}")
+                    else:
+                        if text.startswith("http"):
+                            try:
+                                pinfo = get_product_by_url(text)
+                            except Exception as e:
+                                send_whatsapp_message(from_num, f"Failed to fetch: {e}")
+                                continue
+                            with get_session() as s:
+                                u = s.query(User).filter(User.user_id==from_num, User.platform=="whatsapp").first()
+                                if not u:
+                                    u = User(user_id=from_num, name=from_num, platform="whatsapp"); s.add(u); s.commit()
+                                pr = Product(product_id=pinfo.get("product_id"), user_id=from_num, url=text, platform=pinfo.get("platform"),
+                                             product_name=pinfo.get("title"), image_url=pinfo.get("image"), current_price=pinfo.get("price"),
+                                             prev_price=None, lowest_price=pinfo.get("price"), highest_price=pinfo.get("price"),
+                                             affiliate_link=pinfo.get("affiliate_link"), last_checked=datetime.datetime.utcnow(), tracking_status="active")
+                                s.add(pr); s.commit(); s.refresh(pr)
+                                send_whatsapp_message(from_num, f"✅ Tracking started: {pr.product_name}\nCurrent Price: ₹{pr.current_price}\nID:{pr.id}", pr.affiliate_link, pr.image_url)
+                        else:
+                            send_whatsapp_message(from_num, "Commands: /track <url> | /list | /stop <id>")
     except Exception as e:
-        print("Error processing whatsapp webhook:", e)
+        logger.exception("Error in whatsapp webhook: %s", e)
     return {"status": "ok"}
-
-def send_whatsapp_message(to, text, url=None):
-    if not WHATSAPP_TOKEN or not PHONE_ID:
-        print("WhatsApp credentials missing - cannot send message.")
-        return
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "template",
-        # We'll use a simple text message fallback if template not configured
-        "text": {"body": text}
-    }
-    # If an affiliate URL is present, also send an interactive button message
-    if url:
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": to,
-            "type": "interactive",
-            "interactive": {
-                "type": "button",
-                "body": {"text": text},
-                "action": {"buttons": [{"type": "url", "url": url, "title": "🛒 Buy Now"}]}
-            }
-        }
-    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-    resp = requests.post(f"https://graph.facebook.com/v17.0/{PHONE_ID}/messages", headers=headers, json=payload)
-    if resp.status_code >= 300:
-        print("WhatsApp send failed:", resp.status_code, resp.text)'''

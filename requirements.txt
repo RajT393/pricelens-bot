@@ -1,7 +1,11 @@
 fastapi
-uvicorn
+uvicorn[standard]
 python-dotenv
 requests
-python-telegram-bot==20.3
-APScheduler
+beautifulsoup4
 SQLAlchemy
+psycopg2-binary
+APScheduler
+python-telegram-bot==20.3
+httpx
+python-multipart

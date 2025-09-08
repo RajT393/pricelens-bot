@@ -1,138 +1,79 @@
-# Simple in-memory DB for testing
-tracked_items = []
-current_id = 1
-
-class Item:
-    def __init__(self, user_id, platform, product_id, title, image_url, affiliate_url, price):
-        global current_id
-        self.id = str(current_id)
-        current_id += 1
-        self.user_id = user_id
-        self.platform = platform
-        self.product_id = product_id
-        self.title = title
-        self.image_url = image_url
-        self.affiliate_url = affiliate_url
-        self.current_price = price
-        self.lowest_price = price
-        self.highest_price = price
-
-def init_db():
-    global tracked_items
-    tracked_items = []
-
-def add_tracked_item(user_id, platform, product_id, title, image_url, affiliate_url, price):
-    item = Item(user_id, platform, product_id, title, image_url, affiliate_url, price)
-    tracked_items.append(item)
-    return item
-
-def list_tracked_items(user_id):
-    return [it for it in tracked_items if it.user_id == user_id]
-
-def remove_tracked_item(user_id, item_id):
-    global tracked_items
-    for it in tracked_items:
-        if it.user_id == user_id and it.id == item_id:
-            tracked_items.remove(it)
-            return True
-    return False
-
-
-'''import os
-from sqlalchemy import create_engine, Column, Integer, String, Numeric, DateTime, Text
+import os
+from sqlalchemy import create_engine, Column, Integer, String, Numeric, DateTime, Text, Boolean, func, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, relationship
 import datetime
 
-DATABASE_URL = os.getenv("DATABASE_URL") or "sqlite:///data/pricelens.db"
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("Set DATABASE_URL in .env (postgres connection for Supabase)")
 
-# For SQLite allow multithreaded access
-if DATABASE_URL.startswith("sqlite"):
-    engine = create_engine(DATABASE_URL, connect_args={'check_same_thread': False})
-else:
-    engine = create_engine(DATABASE_URL)
-
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-class TrackedItem(Base):
-    __tablename__ = "tracked_items"
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(String, index=True)    # Telegram user id or Whatsapp phone
-    platform = Column(String, nullable=False)  # amazon / flipkart
-    product_id = Column(String, nullable=True) # ASIN or Flipkart id
-    title = Column(Text, nullable=True)
-    image_url = Column(Text, nullable=True)
-    affiliate_url = Column(Text, nullable=True)
-    current_price = Column(Numeric, nullable=True)
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String, index=True)
+    name = Column(String, nullable=True)
+    platform = Column(String)
+    location_area_code = Column(String, nullable=True)
+    ref_code = Column(String, nullable=True)
+    referred_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=func.now())
+
+
+class Product(Base):
+    __tablename__ = "products"
+    id = Column(Integer, primary_key=True)
+    product_id = Column(String, nullable=True, index=True)
+    user_id = Column(String, index=True)
+    url = Column(Text)
+    platform = Column(String)
+    product_name = Column(Text)
+    image_url = Column(Text)
+    current_price = Column(Numeric)
+    prev_price = Column(Numeric, nullable=True)
     lowest_price = Column(Numeric, nullable=True)
     highest_price = Column(Numeric, nullable=True)
-    last_checked = Column(DateTime, default=datetime.datetime.utcnow)
+    affiliate_link = Column(Text, nullable=True)
+    last_checked = Column(DateTime, default=func.now())
+    tracking_status = Column(String, default="active")
+
+
+class PriceHistory(Base):
+    __tablename__ = "price_history"
+    id = Column(Integer, primary_key=True)
+    product_id = Column(Integer, ForeignKey("products.id"))
+    price = Column(Numeric)
+    checked_at = Column(DateTime, default=func.now())
+
+
+class Promotion(Base):
+    __tablename__ = "promotions"
+    id = Column(Integer, primary_key=True)
+    title = Column(String)
+    message = Column(Text)
+    link = Column(Text, nullable=True)
+    platform = Column(String, nullable=True)
+    area_code = Column(String, nullable=True)
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=func.now())
+
+
+class Referral(Base):
+    __tablename__ = "referrals"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String)
+    points = Column(Integer, default=0)
+    created_at = Column(DateTime, default=func.now())
+
 
 def init_db():
     Base.metadata.create_all(bind=engine)
 
-# DB helper functions
-def add_tracked_item(user_id, platform, product_id, title, image_url, affiliate_url, price):
-    db = SessionLocal()
-    try:
-        item = TrackedItem(
-            user_id=str(user_id),
-            platform=platform,
-            product_id=product_id,
-            title=title,
-            image_url=image_url,
-            affiliate_url=affiliate_url,
-            current_price=price,
-            lowest_price=price,
-            highest_price=price
-        )
-        db.add(item)
-        db.commit()
-        db.refresh(item)
-        return item
-    finally:
-        db.close()
 
-def list_tracked_items(user_id):
-    db = SessionLocal()
-    try:
-        items = db.query(TrackedItem).filter(TrackedItem.user_id==str(user_id)).all()
-        return items
-    finally:
-        db.close()
-
-def remove_tracked_item(user_id, item_id):
-    db = SessionLocal()
-    try:
-        item = db.query(TrackedItem).filter(TrackedItem.user_id==str(user_id), TrackedItem.id==int(item_id)).first()
-        if item:
-            db.delete(item)
-            db.commit()
-            return True
-        return False
-    finally:
-        db.close()
-
-def update_prices(item_id, new_price):
-    db = SessionLocal()
-    try:
-        item = db.query(TrackedItem).filter(TrackedItem.id==int(item_id)).first()
-        if not item:
-            return None
-        changed = False
-        if new_price is not None:
-            if item.current_price is None or new_price != float(item.current_price):
-                item.current_price = new_price
-                if item.lowest_price is None or new_price < float(item.lowest_price):
-                    item.lowest_price = new_price
-                if item.highest_price is None or new_price > float(item.highest_price):
-                    item.highest_price = new_price
-                changed = True
-        item.last_checked = datetime.datetime.utcnow()
-        db.add(item)
-        db.commit()
-        db.refresh(item)
-        return item, changed
-    finally:
-        db.close()'''
+def get_session():
+    return SessionLocal()

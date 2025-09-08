@@ -1,111 +1,131 @@
-import threading
-import time
-import src.db as db
-
-scheduler_running = False
-
-def start_scheduler():
-    global scheduler_running
-    scheduler_running = True
-    t = threading.Thread(target=run_scheduler, daemon=True)
-    t.start()
-
-def stop_scheduler():
-    global scheduler_running
-    scheduler_running = False
-
-def run_scheduler():
-    while scheduler_running:
-        for item in db.tracked_items:
-            # dummy update, later use API to check price
-            item.current_price = item.current_price
-        time.sleep(1800)  # 30 mins
-
-
-'''import os
-import time
-import requests
+import os
+import logging
 from apscheduler.schedulers.background import BackgroundScheduler
-from src.db import list_tracked_items, update_prices
+from src.db import get_session, Product, User, PriceHistory
 from src.affiliate import get_product_by_url
+from src.utils import normalize_price_val
+import datetime
+import requests
+
+logger = logging.getLogger("tracker")
+logger.setLevel(logging.INFO)
+
+SCHED = BackgroundScheduler()
+INTERVAL_SECONDS = int(os.getenv("PRICE_CHECK_INTERVAL_SECONDS", "300"))
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")
+BASE_WAPI = "https://graph.facebook.com/v17.0"
 
-scheduler = BackgroundScheduler()
-INTERVAL_MINUTES = int(os.getenv("PRICE_CHECK_INTERVAL_MINUTES", "60"))
-
-def notify_telegram_chat(chat_id, text, url=None):
+def send_telegram_message(chat_id: str, text: str):
     if not TELEGRAM_TOKEN:
-        print("No telegram token - cannot notify telegram.")
+        logger.warning("No telegram token for notify")
         return
     api = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
-    if url:
-        payload["text"] = f"{text}\n\nBuy: {url}"
-    r = requests.post(api, json=payload)
-    if r.status_code >= 300:
-        print("Telegram notify failed:", r.status_code, r.text)
-
-def notify_whatsapp(phone, text, url=None):
-    if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_ID:
-        print("WhatsApp creds missing - cannot notify WhatsApp.")
-        return
-    # Reuse whatsapp_bot send endpoint format
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": phone,
-        "type": "interactive" if url else "text",
-    }
-    if url:
-        payload["interactive"] = {
-            "type": "button",
-            "body": {"text": text},
-            "action": {"buttons": [{"type": "url", "url": url, "title": "🛒 Buy Now"}]}
-        }
-    else:
-        payload["text"] = {"body": text}
-    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-    resp = requests.post(f"https://graph.facebook.com/v17.0/{WHATSAPP_PHONE_ID}/messages", headers=headers, json=payload)
-    if resp.status_code >= 300:
-        print("WhatsApp notify failed:", resp.status_code, resp.text)
-
-def check_all_prices():
-    print("Running scheduled price check for tracked items...")
-    items = list_tracked_items_all()
-    for it in items:
-        try:
-            # use affiliate API/wrapper to fetch fresh data by url (we stored affiliate_url)
-            data = get_product_by_url(it.affiliate_url or it.image_url or "")
-            new_price = data.get("price")
-            updated = update_prices(it.id, new_price)
-            if updated:
-                item, changed = updated
-                if changed and item.current_price and item.lowest_price and float(item.current_price) <= float(item.lowest_price):
-                    # Notify user
-                    msg = f"📉 Price dropped for {item.title}! Now ₹{item.current_price} (lowest: ₹{item.lowest_price})"
-                    # If user_id looks numeric (telegram), notify via telegram, else treat as whatsapp phone
-                    if str(item.user_id).isdigit():
-                        notify_telegram_chat(item.user_id, msg, item.affiliate_url)
-                    else:
-                        notify_whatsapp(item.user_id, msg, item.affiliate_url)
-        except Exception as e:
-            print("Error checking item", it.id, e)
-
-# Helper to get all items (direct DB query here to avoid circular imports)
-from db import SessionLocal, TrackedItem
-def list_tracked_items_all():
-    db = SessionLocal()
+    payload = {"chat_id": chat_id, "text": text, "parse_mode":"Markdown"}
     try:
-        return db.query(TrackedItem).all()
-    finally:
-        db.close()
+        r = requests.post(api, json=payload, timeout=10)
+        if r.status_code >= 300:
+            logger.warning("Telegram notify failed %s", r.text)
+    except Exception as e:
+        logger.exception("Telegram notify error: %s", e)
+
+def send_whatsapp_message(to: str, text: str, button_url: str = None):
+    if not (WHATSAPP_TOKEN and WHATSAPP_PHONE_ID):
+        logger.warning("WhatsApp creds missing")
+        return
+    endpoint = f"{BASE_WAPI}/{WHATSAPP_PHONE_ID}/messages"
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+    if button_url:
+        payload = {
+            "messaging_product":"whatsapp",
+            "to": to,
+            "type":"interactive",
+            "interactive":{"type":"button","body":{"text":text},"action":{"buttons":[{"type":"url","url":button_url,"title":"🛒 Buy Now"}]}}}
+    else:
+        payload = {"messaging_product":"whatsapp","to":to,"type":"text","text":{"body":text}}
+    try:
+        r = requests.post(endpoint, headers=headers, json=payload, timeout=10)
+        if r.status_code >= 300:
+            logger.warning("WhatsApp notify failed %s", r.text)
+    except Exception as e:
+        logger.exception("WhatsApp notify error: %s", e)
+
+def suggestion_text(new_price, lowest, highest):
+    try:
+        if new_price is None:
+            return "OK deal"
+        if lowest is None:
+            lowest = new_price
+        if highest is None:
+            highest = new_price
+        if float(new_price) <= float(lowest):
+            return "BUY NOW — Lowest price!"
+        if float(new_price) >= float(highest):
+            return "WAIT — Price at (near) highest"
+        if float(new_price) <= float(lowest) * 1.02:
+            return "Good deal — consider buying"
+        return "OK deal"
+    except:
+        return "OK deal"
+
+def check_prices_job():
+    logger.info("Running price check job...")
+    with get_session() as s:
+        prods = s.query(Product).filter(Product.tracking_status=="active").all()
+        for p in prods:
+            try:
+                info = get_product_by_url(p.url)
+                new_price = info.get("price")
+                if new_price is None:
+                    logger.debug("No price for product %s", p.id)
+                    continue
+                old_price = float(p.current_price) if p.current_price is not None else None
+                new_price_f = float(new_price)
+                if old_price is None or new_price_f != old_price:
+                    p.prev_price = old_price
+                    p.current_price = new_price_f
+                    if p.lowest_price is None or new_price_f < float(p.lowest_price):
+                        p.lowest_price = new_price_f
+                    if p.highest_price is None or new_price_f > float(p.highest_price):
+                        p.highest_price = new_price_f
+                    p.last_checked = datetime.datetime.utcnow()
+                    s.add(p); s.commit()
+                    hist = PriceHistory(product_id=p.id, price=new_price_f, checked_at=datetime.datetime.utcnow())
+                    s.add(hist); s.commit()
+                    if p.prev_price is None:
+                        delta_text = ""
+                    else:
+                        diff = new_price_f - float(p.prev_price)
+                        sign = "increased" if diff > 0 else "decreased"
+                        delta_text = f"The Product Price has {sign} by ₹{abs(int(diff))}.\n\n"
+                    msg = (
+                        f"{delta_text}"
+                        f"☀️ *{p.product_name}*\n\n"
+                        f"Previous price: ₹{int(p.prev_price) if p.prev_price is not None else 'N/A'}\n"
+                        f"Current price: ₹{int(p.current_price)}\n\n"
+                        f"Click here: {p.affiliate_link or p.url}\n\n"
+                        f"⏱ Updated at [{p.last_checked.strftime('%d %b %Y, %H:%M')}]\n\n"
+                        f"{suggestion_text(p.current_price, p.lowest_price, p.highest_price)}"
+                    )
+                    user = s.query(User).filter(User.user_id==p.user_id).first()
+                    if user and user.platform == "telegram":
+                        send_telegram_message(p.user_id, msg)
+                    else:
+                        send_whatsapp_message(p.user_id, msg, button_url=p.affiliate_link or p.url)
+            except Exception as e:
+                logger.exception("Error while checking product %s: %s", p.id, e)
 
 def start_scheduler():
-    scheduler.add_job(check_all_prices, 'interval', minutes=INTERVAL_MINUTES, id='price_check', replace_existing=True)
-    scheduler.start()
-    print(f"Scheduler started. Checking every {INTERVAL_MINUTES} minutes.")
+    if SCHED.get_jobs():
+        return
+    SCHED.add_job(check_prices_job, 'interval', seconds=INTERVAL_SECONDS, id='price_check', max_instances=1)
+    SCHED.start()
+    logger.info("Scheduler started with interval %s seconds", INTERVAL_SECONDS)
 
 def stop_scheduler():
-    scheduler.shutdown(wait=False)'''
+    try:
+        SCHED.shutdown(wait=False)
+    except Exception:
+        pass
